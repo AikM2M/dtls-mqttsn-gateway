@@ -8,7 +8,7 @@
     * TLS with Certificate 
 ## Project Description
 The current release of MQTTSN Gateway Application @ https://github.com/eclipse/paho.mqtt-sn.embedded-c.git supports UDP based
-connections for its mqttsn clients and lags in providing DTLS based security. This new release of DTLS based Multi-Threaded MQTTSN Gateway Application @ https://github.com/onem2m-iril1/dtls-mqttsngateway.git supports Multi-threaded DTLS based connections to its mqttsn clients which use either Pre-shared Keys or Certificates to connect to respective MQTTSN Gateway. In addition to Certificate based TLS over TCP connection support, a Pre-shared Key based TLS over TCP connection suppport is also provided to facilitate the connectivity of gateway to MQTT broker.
+connections for its mqttsn clients and lags in providing DTLS based security. This new release of DTLS based Multi-Threaded MQTTSN Gateway Application supports Multi-threaded DTLS based connections to its mqttsn clients which use either Pre-shared Keys or Certificates to connect to respective MQTTSN Gateway. In addition to Certificate based TLS over TCP connection support, a Pre-shared Key based TLS over TCP connection suppport is also provided to facilitate the connectivity of gateway to MQTT broker.
 ## Dependencies
 * git
 ```
