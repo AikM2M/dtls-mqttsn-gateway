@@ -140,8 +140,8 @@ $ ./MQTTSNGateway -f gateway.conf01
    * Disconnected client is deleted/erased from the existing Client List
 ## Author
 - TOMOAKI YAMAGUCHI
-## Contributor 
-- BILAL IMRAN
+## Contributor  
+- BILAL IMRAN 
 ## oneM2M Project Funding Agency
 - National Centre for Cyber Security (NCCS) HEC Gov. Pakistan
 ## oneM2M Team 
