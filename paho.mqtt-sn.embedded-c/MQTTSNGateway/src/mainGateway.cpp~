@@ -1,0 +1,691 @@
+/*	File Name:		DTLS_Server.cpp
+	File Purpose:	This file represents the implementation of a threaded 
+					DTLS Server over UDP which uses MQTT-SN API to communicate
+					with the MQTT Broker
+	File Author:	Bilal Imran
+	Date & Time:	July 05, 2019 | 11:17am 
+*/
+
+// Gateway's Libraries
+#include "MQTTSNGateway.h"
+#include "MQTTSNGWBrokerRecvTask.h"
+#include "MQTTSNGWBrokerSendTask.h"
+#include "MQTTSNGWClientRecvTask.h"
+#include "MQTTSNGWClientSendTask.h"
+#include "MQTTSNGWPacketHandleTask.h"
+using namespace MQTTSNGW;
+
+// Main Program Libraries
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/ip.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <regex>
+#include <string>
+#include <stdlib.h>
+
+#include <sys/time.h>
+#include <netinet/in.h>
+
+#include <openssl/ssl.h>
+#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <openssl/rand.h>
+#include <openssl/hmac.h>
+
+/* DTLS Control Parameter 
+ * <DTLS-with-PSK> USE_PSK
+ * <DTLS-with-CERT> USE_CERT
+ * */
+//#define USE_CERT 			
+#define USE_PSK
+
+#define MSGLEN						4096
+#define MAX_PACKET_SIZE			1500
+#define PSK_KEY_LENGTH			5 			
+#define COOKIE_SECRET_LENGTH 	8
+#define MaxRows					3
+#define MaxColumns				3
+
+const char* psk_hint 			= "bridge";
+int uniPortNo	 					= 10000;
+const char* ipAddress 			= "192.168.0.114";
+
+// Global Variables
+
+int on 							= 1;
+int res 							= 1;
+int bytesRcvd 					= 0;
+socklen_t cliLen;
+socklen_t len 					= sizeof(on);
+unsigned char buf[MSGLEN];      /* watch for incoming messages */
+
+const char* caFILE;
+const char* caKEY;
+const char* srvFILE;
+const char* srvKEY;
+int fd;
+int reuse = 1;
+char socketBUFF[MSGLEN];
+
+SSL_CTX *ctx;
+SSL *ssl;
+BIO *bio;
+struct timeval timeout;
+static struct       sockaddr_in cliAddr;    /* the client's address */
+static struct       sockaddr_in servAddr;   /* our server's address */
+
+int cookie_initialized;
+unsigned char cookie_secret[COOKIE_SECRET_LENGTH];
+
+/* Psk Look-UP Table (Psk-LUPT)
+ * 'Row' represents the client entries
+ * 'Column' represents the client's info such as;
+ * <Column00> Device ID
+ * <Column01> Psk_Identity
+ * <Column02> Psk Value (in Hex) */
+const char* Psk_LuPT[MaxRows][MaxColumns] = {
+{"ADN-AE-01", "AE123-LOCK@in.provider.com", "0102030405"},
+{"ADN-AE-02", "AE456-LOCK@in.provider.com", "0504030201"},
+{"MN-CSE-01", "CSE123-Gateway@in.provider.com", "0101020305"}
+}; 
+
+// Thread Parameters
+void* ThreadControl(void*);
+typedef struct {
+    int activefd;
+    int size;
+    unsigned char b[MSGLEN];
+	 struct sockaddr_in peerAddr;
+} threadArgs;
+
+/* variables needed for threading */
+threadArgs* args;
+pthread_t threadid;
+pthread_mutex_t lock;
+
+//	Function Declarations
+const char* FindPsk (const char* psk_id);
+static unsigned int psk_server_cb(SSL *ssl, const char *identity,
+                                  unsigned char *psk,
+                                  unsigned int max_psk_len);
+int dtls_verify_callback (int ok, X509_STORE_CTX *ctx); 
+static int generate_cookie(SSL *ssl, unsigned char *cookie, unsigned int *cookie_len);
+static int verify_cookie(SSL *ssl, const unsigned char *cookie, unsigned int cookie_len);
+int ServerUDPPortOpen();
+int ServerDTLSInitialize();
+int ServerDTLSListen();
+int ServerDTLSHandshake();
+int ServerStart();
+
+/*  Gateway Application	*/
+Gateway gateway; 
+PacketHandleTask  task1(&gateway);
+BrokerSendTask    task2(&gateway);
+BrokerRecvTask    task3(&gateway);
+ClientSendTask    task4(&gateway);
+
+// Gateway's Threads
+void* PackThread 			(void* );		// for packet handling 
+void* BrkSndThread 		(void* );		// for broker send task
+void* BrkRcvThread 		(void* );		// for broker rcv task	
+void* SNSndThread 		(void* );		// for client send task
+pthread_t tid1, tid2, tid3, tid4;
+
+int main(int argc, char** argv)
+{
+	// initialize the gateway
+	gateway.initialize(argc, argv);
+	
+	/* SPIN the four main THREADs */
+   pthread_create(&tid1, NULL, PackThread, NULL);
+   pthread_create(&tid2, NULL, BrkSndThread, NULL);
+   pthread_create(&tid3, NULL, BrkRcvThread, NULL);
+   pthread_create(&tid4, NULL, SNSndThread, NULL);
+	
+	// start the Server
+	ServerStart();
+   return 0;
+}
+
+void* PackThread   (void* arg) 	{
+	task1.run();
+}
+void* BrkSndThread (void* arg) 	{
+	task2.run();
+} 
+void* BrkRcvThread (void* arg) 	{
+	task3.run();
+}
+void* SNSndThread  (void* arg) 	{
+	task4.run();
+} 
+
+/* Psk-LUPT Associated Functions 
+ * <Function01> Check if the called Psk_Identity is available inside LuPT, if so
+ * then return the associated Psk Value */
+const char* FindPsk (const char* psk_id) {
+		int i = 0;
+		while(i < MaxRows) {
+			if (strcmp(Psk_LuPT[i][1], psk_id) != 0)
+				i++;
+			else
+				return Psk_LuPT[i][2];
+		}
+		return "Not Found Psk-ID";
+}
+
+/* Psk Call-Back Functions */
+unsigned int psk_server_cb(SSL *ssl, const char *identity,
+                                  unsigned char *psk,
+                                  unsigned int max_psk_len)
+{
+    long key_len = 0;
+    unsigned char *key;
+
+    if (identity == NULL) {
+        printf("Error: client did not send PSK identity\n");
+        // goto out_err;
+        printf("Error in PSK server callback\n");
+		return 0;
+    }
+   
+   /* here we could lookup the given identity e.g. from a database */
+    const char* psk_ret = FindPsk(identity);
+    if ( strcmp(psk_ret, "Not Found Psk-ID") == 0 ) {
+        printf("PSK warning: client identity not what we expected \n");
+        // goto out_err;
+        printf("Error in PSK server callback\n");
+		return 0;
+    } else
+        printf("PSK client identity found\n");
+   
+    /* here we could lookup the given identity e.g. from a database 
+    if (strcmp(identity, psk_identity) != 0) {
+        printf("PSK warning: client identity not what we expected"
+                   " (got '%s' expected '%s')\n", identity, psk_identity);
+        goto out_err;
+    } else {
+        printf("PSK client identity found\n");
+    } */
+
+    /* convert the PSK key to binary */
+    key = OPENSSL_hexstr2buf(psk_ret, &key_len);
+    if (key == NULL) {
+        printf("Could not convert PSK key '%s' to buffer\n", psk_ret);
+        return 0;
+    }
+    if (key_len > (int)max_psk_len) {
+        printf("psk buffer of callback is too small (%d) for key (%ld)\n",
+                   max_psk_len, key_len);
+        OPENSSL_free(key);
+        return 0;
+    }
+
+    memcpy(psk, key, key_len);
+    OPENSSL_free(key);
+
+    printf("fetched PSK len=%ld\n", key_len);
+    return key_len;
+
+/* out_err:
+    printf("Error in PSK server callback\n");
+    return 0; */
+}
+
+int dtls_verify_callback (int ok, X509_STORE_CTX *ctx) {
+	/* This function should ask the user
+	 * if he trusts the received certificate.
+	 * Here we always trust.
+	 */
+	return 1;
+}
+
+int generate_cookie(SSL *ssl, unsigned char *cookie, unsigned int *cookie_len)
+{
+	unsigned char *buffer, result[EVP_MAX_MD_SIZE];
+	unsigned int length = 0, resultlength;
+	union {
+		struct sockaddr_storage ss;
+		struct sockaddr_in s4;
+	} peer;
+
+	/* Initialize a random secret */
+		if (!RAND_bytes(cookie_secret, COOKIE_SECRET_LENGTH))
+			{
+			printf("error setting random cookie secret\n");
+			return 0;
+			}
+	
+	/* Read peer information */
+	(void) BIO_dgram_get_peer(SSL_get_rbio(ssl), &peer);
+
+	/* Create buffer with peer's address and port */
+	length = 0;
+	switch (peer.ss.ss_family) {
+		case AF_INET:
+			length += sizeof(struct in_addr);
+			break;
+		default:
+			OPENSSL_assert(0);
+			break;
+	}
+	length += sizeof(in_port_t);
+	buffer = (unsigned char*) OPENSSL_malloc(length);
+
+	if (buffer == NULL)
+		{
+		printf("out of memory\n");
+		return 0;
+		}
+
+	switch (peer.ss.ss_family) {
+		case AF_INET:
+			memcpy(buffer,
+				   &peer.s4.sin_port,
+				   sizeof(in_port_t));
+			memcpy(buffer + sizeof(peer.s4.sin_port),
+				   &peer.s4.sin_addr,
+				   sizeof(struct in_addr));
+			break;
+		default:
+			OPENSSL_assert(0);
+			break;
+	}
+
+	/* Calculate HMAC of buffer using the secret */
+	HMAC(EVP_sha1(), (const void*) cookie_secret, COOKIE_SECRET_LENGTH,
+		 (const unsigned char*) buffer, length, result, &resultlength);
+	OPENSSL_free(buffer);
+
+	memcpy(cookie, result, resultlength);
+	*cookie_len = resultlength;
+
+	return 1;
+}
+
+int verify_cookie(SSL *ssl, const unsigned char *cookie, unsigned int cookie_len)
+{
+	unsigned char *buffer, result[EVP_MAX_MD_SIZE];
+	unsigned int length = 0, resultlength;
+	union {
+		struct sockaddr_storage ss;
+		struct sockaddr_in s4;
+	} peer;
+
+	/* Read peer information */
+	(void) BIO_dgram_get_peer(SSL_get_rbio(ssl), &peer);
+
+	/* Create buffer with peer's address and port */
+	length = 0;
+	switch (peer.ss.ss_family) {
+		case AF_INET:
+			length += sizeof(struct in_addr);
+			break;
+		default:
+			OPENSSL_assert(0);
+			break;
+	}
+	length += sizeof(in_port_t);
+	buffer = (unsigned char*) OPENSSL_malloc(length);
+
+	if (buffer == NULL)
+		{
+		printf("out of memory\n");
+		return 0;
+		}
+
+	switch (peer.ss.ss_family) {
+		case AF_INET:
+			memcpy(buffer,
+				   &peer.s4.sin_port,
+				   sizeof(in_port_t));
+			memcpy(buffer + sizeof(in_port_t),
+				   &peer.s4.sin_addr,
+				   sizeof(struct in_addr));
+			break;
+		default:
+			OPENSSL_assert(0);
+			break;
+	}
+
+	/* Calculate HMAC of buffer using the secret */
+	HMAC(EVP_sha1(), (const void*) cookie_secret, COOKIE_SECRET_LENGTH,
+		 (const unsigned char*) buffer, length, result, &resultlength);
+	OPENSSL_free(buffer);
+	
+	if (cookie_len == resultlength && memcmp(result, cookie, resultlength) == 0) {
+			return 1;
+	}
+	
+	return 0;
+}
+
+int ServerDTLSInitialize() {	
+/* Module 01:
+ * [Start] SSL Session Creation via Context _ctx */
+	SSL_library_init();
+	OpenSSL_add_ssl_algorithms();
+	SSL_load_error_strings();
+	ERR_load_BIO_strings();
+	ctx = SSL_CTX_new(DTLSv1_2_server_method());
+
+/* We accept all ciphers, including NULL.
+ * Not recommended beyond testing and debugging */	
+// SSL_CTX_set_cipher_list(ctx, "ECDHE-ECDSA-AES256-GCM-SHA384");
+	
+	SSL_CTX_set_cipher_list(ctx, "ALL:NULL:eNULL:aNULL");
+	SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+
+#ifdef USE_CERT	 
+	if (!SSL_CTX_use_certificate_file(ctx, srvFILE, SSL_FILETYPE_PEM))
+		printf("\nERROR: no certificate found!");
+		
+	if (!SSL_CTX_use_PrivateKey_file(ctx, srvKEY, SSL_FILETYPE_PEM))
+		printf("\nERROR: no private key found!");
+
+	if (!SSL_CTX_check_private_key (ctx))
+		printf("\nERROR: invalid private key!");
+
+	/* Client has to authenticate */
+	SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, dtls_verify_callback);
+#endif
+
+#ifdef USE_PSK
+	/* Use Psk & it's Psk-Hint */
+	SSL_CTX_set_psk_server_callback(ctx, &psk_server_cb);
+	SSL_CTX_use_psk_identity_hint(ctx, psk_hint);
+#endif
+
+	SSL_CTX_set_read_ahead(ctx, 1);
+	//SSL_CTX_set_cookie_generate_cb(ctx, generate_cookie);
+	//SSL_CTX_set_cookie_verify_cb(ctx, &verify_cookie);
+// [END]
+	printf("DTLS Initialized OK\n");
+	return 0;
+}
+
+int ServerDTLSListen() {	
+/*	memset(&peer_addr, 0, sizeof(struct sockaddr_storage));
+	
+	/* Create BIO 
+	bio = BIO_new_dgram(fd, BIO_NOCLOSE);
+
+	/* Set and activate timeouts 
+	timeout.tv_sec = 5;
+	timeout.tv_usec = 0;
+	BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_RECV_TIMEOUT, 0, &timeout);
+	
+	ssl = SSL_new(ctx);
+	SSL_set_bio(ssl, bio, bio);
+	SSL_set_options(ssl, SSL_OP_COOKIE_EXCHANGE);
+
+	int dtls_ret;
+	do {
+		dtls_ret = DTLSv1_listen(ssl, (BIO_ADDR *) &peer_addr);
+	} while (dtls_ret <= 0); 
+
+	printf("DTLS Listened Successfully \n"); */
+	return 0;
+}
+
+int ServerDTLSHandshake() {	
+/* Finish handshake */
+	int ret;
+	do { 
+		ret = SSL_accept(ssl);
+	}
+	while (ret <= 0);
+	
+	char* buf;
+	if (ret < 0) {
+		perror("SSL_accept");
+		printf("%s\n", ERR_error_string(ERR_get_error(), buf));
+		return ret;
+	}
+	
+/* Set and activate timeouts */
+	timeout.tv_sec = 5;
+	timeout.tv_usec = 0;
+	BIO_ctrl(SSL_get_rbio(ssl), BIO_CTRL_DGRAM_SET_RECV_TIMEOUT, 0, &timeout);
+
+	if (SSL_get_peer_certificate(ssl)) {
+		printf ("------------------------------------------------------------\n");
+		X509_NAME_print_ex_fp(stdout, X509_get_subject_name(SSL_get_peer_certificate(ssl)), 1, XN_FLAG_MULTILINE);
+		printf("\n\n Cipher: %s", SSL_CIPHER_get_name(SSL_get_current_cipher(ssl)));
+		printf ("\n------------------------------------------------------------\n\n");
+	} 
+	
+	printf("DTLS Handshake Successfully \n");	
+	return 0;
+}
+
+int ServerUDPPortOpen()
+{
+	if (uniPortNo == 0)
+	{
+		printf("error portNo undefined in UDPPort::open\n");
+		return -1;
+	}
+
+	uint32_t ip = inet_addr(ipAddress);
+	
+	/*------ Create unicast socket --------*/
+	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (fd < 0)
+	{
+		printf("fd1 error can't create unicast socket in UDPPort::open\n");
+		return -1;
+	}
+
+	/* clear servAddr each loop */
+   // memset((char *)&servAddr, 0, sizeof(servAddr));
+
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+	servAddr.sin_family = AF_INET;
+	servAddr.sin_port = htons(uniPortNo);
+	servAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	if (::bind(fd, (sockaddr*) &servAddr, sizeof(servAddr)) < 0)
+	{
+		printf("fd1 error can't bind unicast socket in UDPPort::open\n");
+		return -1;
+	}
+
+	printf("UDP Port Opened \n");
+	return 0;
+}
+
+int ServerStart() {
+	int rc;
+	int on = 1;
+	int i = 0;
+	printf("i m here 00\n");	
+	ServerUDPPortOpen();
+	
+	printf("i m here 01\n");
+	ServerDTLSInitialize();
+
+/*	ServerDTLSListen();
+
+	if ((rc = ServerDTLSHandshake()) != 0) {
+		printf("DTLS_Handshake [Status = Failed] \n");
+		goto END;	
+	}
+	printf("DTLS_Handshake [Status = Ok] \n"); */
+
+    printf("Awaiting client connection on port %d\n", uniPortNo);
+
+    int res;
+    while (1) {
+
+        memset(&threadid, 0, sizeof(threadid));
+        args = (threadArgs *) malloc(sizeof(threadArgs));
+
+        memset(&socketBUFF, 0, sizeof(socketBUFF));
+		  memset(&cliAddr, 0, sizeof(cliAddr));
+		  cliLen = sizeof(cliAddr);
+	    
+	     do {
+	    			bytesRcvd = (int)recvfrom(fd, (char*) socketBUFF, MSGLEN, 0,
+    		       		 (struct sockaddr*) &cliAddr, &cliLen);
+	     } while (bytesRcvd <= 0);
+
+        if (bytesRcvd < 0) {
+            printf("No clients in que, enter idle state\n");
+            continue;
+        }
+
+        else if (bytesRcvd > 0) {
+
+            /* put all the bytes from buf into args */
+            memcpy(args->b, socketBUFF, MAX_PACKET_SIZE);
+
+            args->size = bytesRcvd;
+
+            if ((args->activefd = socket(AF_INET, SOCK_DGRAM, 0)) < 0 ) {
+                printf("Cannot create socket.\n");
+                goto END;
+            }
+
+            res = setsockopt(args->activefd, SOL_SOCKET, SO_REUSEADDR, &on,
+                    sizeof(on));
+
+            if (res < 0) {
+                printf("Setsockopt SO_REUSEADDR failed.\n");
+                goto END;
+            }
+
+            #ifdef SO_REUSEPORT
+                res = setsockopt(args->activefd, SOL_SOCKET, SO_REUSEPORT, &on,
+                        sizeof(on));
+                if (res < 0) {
+                    printf("Setsockopt SO_REUSEPORT failed.\n");
+                    goto END;    
+                }
+            #endif
+
+            if (::bind(args->activefd, (const struct sockaddr *)&servAddr, 
+            	sizeof(struct sockaddr_in)) != 0) {
+                printf("Udp bind failed.\n");
+                goto END;
+            }   	            
+               
+            if (::connect(args->activefd, (const struct sockaddr *)&cliAddr,
+                        sizeof(cliAddr)) != 0) {
+                printf("Udp connect failed.\n");
+                goto END;
+            }
+        }
+        else {
+            /* else bytesRcvd = 0 */
+            printf("Recvfrom failed.\n");
+            goto END;
+        }
+       
+        printf("Connected!\n");
+		  args->peerAddr = cliAddr; 
+
+        /* SPIN A THREAD HERE TO HANDLE "buff" and "reply/ack" */
+        pthread_create(&threadid, NULL, ThreadControl, args);
+        printf("control passed to ThreadControl.\n");
+
+        // wait 2 sec
+        sleep(2);
+    }
+
+END:
+	close(fd);
+	return -1;
+}
+
+void* ThreadControl(void* openSock)
+{
+    //pthread_detach(pthread_self());
+
+    threadArgs* args = (threadArgs*)openSock;
+	 int 					  ret;
+    int                recvLen = 0;                /* length of message     */
+    int                activefd = args->activefd;  /* the active descriptor */
+    int                msgLen = args->size;        /* the size of message   */
+    unsigned char      buff[MAX_PACKET_SIZE];               /* the incoming message  */
+    char               ack[] = "I hear you fashizzle!\n";
+    SSL 			   	  *ssl;
+    int                e;                          /* error */
+ 	 int 			   	  rc;
+ 	 char  				  *buf;	
+ 	 std::string mIP	= inet_ntoa(args->peerAddr.sin_addr);
+    ClientRecvTask *taskinfo;
+    
+    //memcpy(buff, args->b, sizeof(buff));
+
+    /* set the session ssl to client connection port */
+    /* Create BIO */
+    //for_reading = BIO_new(BIO_s_mem());
+    //for_writing = BIO_new(BIO_s_mem());
+    //BIO_set_mem_eof_return(for_reading, -1);
+    //BIO_set_mem_eof_return(for_writing, -1);
+	bio = BIO_new_dgram(activefd, BIO_NOCLOSE);
+
+	/* Set and activate timeouts */
+	timeout.tv_sec = 5;
+	timeout.tv_usec = 0;
+	BIO_ctrl(bio, BIO_CTRL_DGRAM_SET_RECV_TIMEOUT, 0, &timeout);
+
+  	/* Create the SSL Object */
+    printf("SSL new Session created \n");
+    if ((ssl = SSL_new(ctx)) == NULL) {
+        printf("SSL_new error.\n");
+        goto END;
+    }
+
+    //SSL_set_bio(ssl, for_reading, for_writing);
+    SSL_set_accept_state(ssl);
+	 SSL_set_bio(ssl, bio, bio);
+	//SSL_set_fd(ssl, activefd);
+/*	SSL_set_options(ssl, SSL_OP_COOKIE_EXCHANGE);
+	
+	memset(&args->peer_addr, 0, sizeof(struct sockaddr_storage));
+	int dtls_ret;
+	do {
+		dtls_ret = DTLSv1_listen(ssl, (BIO_ADDR *) &args->peer_addr);
+	} while (dtls_ret <= 0); 
+	printf("DTLS Listened Successfully \n"); */
+    
+    printf("SSl handshake Started \n");
+	do { 
+		ret = SSL_accept(ssl);
+	}
+	while (ret <= 0);
+	
+	if (ret < 0) {
+		printf("%s\n", ERR_error_string(ERR_get_error(), buf));
+		goto END;
+	}
+
+	printf("SSL Handshake is complete \n");
+
+	// Start the ClientRecvTask task2 and run it here
+	printf("Creating the ClientRecvTask Object \n");
+   taskinfo = (ClientRecvTask*) malloc (sizeof(ClientRecvTask));
+	taskinfo = new ClientRecvTask(&gateway);
+
+	taskinfo->getSN()->set(ssl);
+	taskinfo->getSN()->setmIP(mIP);
+	
+	taskinfo->run(); 
+
+END:
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(activefd);
+    free(openSock);                
+    printf("Client left return to idle state\n");
+    printf("Exiting thread.\n\n");
+    pthread_exit(openSock);
+
+}
