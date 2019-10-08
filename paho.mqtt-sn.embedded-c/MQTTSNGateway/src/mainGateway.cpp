@@ -192,6 +192,7 @@ int main(int argc, char** argv)
 	
 	int res;
 	while (1) {
+AGAIN:
 		printf("Awaiting client connection on port %d\n", uniPortNo);
 		memset(&threadid[c], 0, sizeof(threadid[c]));
 		args = (threadArgs *) malloc(sizeof(threadArgs));	
@@ -210,54 +211,57 @@ int main(int argc, char** argv)
 		}
 
 		else if (bytesRcvd > 0) {
-			/* put all the bytes from buf into args */
-			memcpy(args->b, socketBUFF, MAX_PACKET_SIZE);
-			args->size = bytesRcvd;
-			if ((args->activefd = socket(AF_INET, SOCK_DGRAM, 0)) < 0 ) {
-				printf("Cannot create socket.\n");
+			if ((strcmp((const char*) socketBUFF, "Client Hello")) == 0) {
+				/* put all the bytes from buf into args */
+				memcpy(args->b, socketBUFF, MAX_PACKET_SIZE);
+				args->size = bytesRcvd;
+				if ((args->activefd = socket(AF_INET, SOCK_DGRAM, 0)) < 0 ) {
+					printf("Cannot create socket.\n");
+					return -1;
+				}
+	
+				res = setsockopt(args->activefd, SOL_SOCKET, SO_REUSEADDR, &on,
+				sizeof(on));
+				if (res < 0) {
+				printf("Setsockopt SO_REUSEADDR failed.\n");
 				return -1;
-			}
-
-		res = setsockopt(args->activefd, SOL_SOCKET, SO_REUSEADDR, &on,
-			sizeof(on));
-		if (res < 0) {
-			printf("Setsockopt SO_REUSEADDR failed.\n");
-			return -1;
-		}
+				}
 
 #ifdef SO_REUSEPORT
-                res = setsockopt(args->activefd, SOL_SOCKET, SO_REUSEPORT, &on,
-                        sizeof(on));
-                if (res < 0) {
-                    printf("Setsockopt SO_REUSEPORT failed.\n");
-                    return -1;    
-                }
+				res = setsockopt(args->activefd, SOL_SOCKET, SO_REUSEPORT, &on,
+				sizeof(on));
+				if (res < 0) {
+				printf("Setsockopt SO_REUSEPORT failed.\n");
+				return -1;    
+				}
 #endif
-
-		if (::bind(args->activefd, (const struct sockaddr *)&servAddr, 
-			sizeof(struct sockaddr_in)) != 0) {
-			printf("Udp bind failed.\n");
-			return -1;
-		}   	
+				if (::bind(args->activefd, (const struct sockaddr *)&servAddr, 
+				sizeof(struct sockaddr_in)) != 0) {
+					printf("Udp bind failed.\n");
+					return -1;
+				}   	
                
-		if (::connect(args->activefd, (const struct sockaddr *)&cliAddr,
-				sizeof(cliAddr)) != 0) {
-			printf("Udp connect failed.\n");
-			return -1;
+				if (::connect(args->activefd, (const struct sockaddr *)&cliAddr,
+					sizeof(cliAddr)) != 0) {
+					printf("Udp connect failed.\n");
+					return -1;
+				}
 			}
+			else
+				goto AGAIN;
+		}
+        	else {
+        	    /* else bytesRcvd = 0 */
+        	    printf("Recvfrom failed.\n");
+        	    return -1;
+        	}
+        	printf("Connected!\n");
+		args->count = c;
+        	/* SPIN A THREAD HERE TO HANDLE "buff" and "reply/ack" */
+        	pthread_create(&threadid[c], NULL, ThreadControl, args);
+		sleep(2);
+		c++;
 	}
-        else {
-            /* else bytesRcvd = 0 */
-            printf("Recvfrom failed.\n");
-            return -1;
-        }
-        printf("Connected!\n");
-	args->count = c;
-        /* SPIN A THREAD HERE TO HANDLE "buff" and "reply/ack" */
-        pthread_create(&threadid[c], NULL, ThreadControl, args);
-	sleep(2);
-	c++;
-    }
    
    pthread_join(tid1, 0);
    pthread_join(tid2, 0);
