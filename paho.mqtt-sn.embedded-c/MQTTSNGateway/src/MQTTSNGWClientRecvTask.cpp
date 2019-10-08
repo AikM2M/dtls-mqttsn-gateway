@@ -94,7 +94,6 @@ void ClientRecvTask::run( ) {
 	packetEventQue = _gateway->getPacketEventQue();
 	fwd = nullptr;
 	client = nullptr;
-	MQTTSNPacket* packet;
 	char buf[128];
 	int rc; 
 	int dtls_timeout = 10;
@@ -104,11 +103,11 @@ void ClientRecvTask::run( ) {
 	uint8_t rcvbuf[MQTTSNGW_MAX_PACKET_SIZE];
 	int len;
 	clientList->print_list();
+	MQTTSNPacket* temp;
 	
 	while(1) {
 		WirelessNodeId nodeId;
-		packet = (MQTTSNPacket*) malloc (sizeof(MQTTSNPacket));
-		packet = new MQTTSNPacket();
+		MQTTSNPacket* packet = new MQTTSNPacket();
 		PBuf = packet->getbuf(); // Added
 		PBufLen = packet->getbufLen(); 	// Added
 		len = _sensorNetwork->read(ssl, (uint8_t*) rcvbuf, MQTTSNGW_MAX_PACKET_SIZE);
@@ -134,7 +133,7 @@ void ClientRecvTask::run( ) {
 		packet->setbuf(PBuf);
 		packet->setbufLen(len);
 		
-		MQTTSNPacket* temp = packet;
+		temp = packet;
 
 		_sensorNetwork->getSenderAddress()->setAddress(addr.sin_addr.s_addr, addr.sin_port);
 
