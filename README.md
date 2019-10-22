@@ -1,4 +1,4 @@
-# dtls-mqttsn-gateway
+# SecGW: A DTLS based Secure MQTTSN Gateway Application
 ## Main Features
 * Multi-threaded DTLS over UDP connection modes supported for mqttsn clients 
     * DTLS with PSK
